@@ -1,0 +1,12 @@
+name = "vaultproxy-edge"
+main = "src/index.ts"
+compatibility_date = "2024-03-01"
+
+[vars]
+CONTROL_PLANE_URL = "https://api.vaultproxy.dev"
+
+# KV namespace for caching resolved keys (reduces control plane round-trips)
+# Uncomment after creating: wrangler kv:namespace create CACHE
+# [[kv_namespaces]]
+# binding = "CACHE"
+# id = "<your-namespace-id>"

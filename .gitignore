@@ -1,0 +1,40 @@
+# Binaries
+control-plane/vaultproxy
+*.exe
+*.out
+
+# Go
+control-plane/vendor/
+
+# Node
+edge-proxy/node_modules/
+edge-proxy/.wrangler/
+edge-proxy/dist/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+dist/
+build/
+.git.broken
+dashboard/node_modules/
+edge-proxy/node_modules/
