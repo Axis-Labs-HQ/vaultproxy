@@ -19,6 +19,7 @@ pub struct ResolvedCredential {
     /// Default auth header name (informational — proxy uses provider registry).
     pub auth_header: String,
     resolved_at: Instant,
+    pub org_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +30,9 @@ struct ResolveResponse {
     /// Path-based injection rules from the control plane.
     #[serde(default)]
     dynamic_rules: Vec<DynamicRule>,
+    /// Organization ID — needed for policy evaluation.
+    #[serde(default)]
+    org_id: Option<String>,
 }
 
 /// Resolves hostnames to credentials via the control plane's resolve-by-host endpoint.
@@ -86,6 +90,7 @@ impl Resolver {
                             dynamic_rules: data.dynamic_rules,
                             auth_header: "Authorization".to_string(),
                             resolved_at: Instant::now(),
+                            org_id: data.org_id,
                         };
                         self.cache.insert(hostname.to_string(), cred.clone());
                         debug!(host = %hostname, "Resolved from control plane");

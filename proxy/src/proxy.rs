@@ -1,4 +1,5 @@
 use crate::ca::CertificateAuthority;
+use crate::policy::{self, PolicyResult};
 use crate::credential::Resolver;
 use crate::providers::{InjectSpec, Registry};
 
@@ -55,6 +56,7 @@ pub async fn run(
     let listener = TcpListener::bind(addr).await?;
     let tls_cache = Arc::new(TlsCache::new(ca));
     let registry = Arc::new(registry);
+    let evaluator = evaluator.clone();
 
     info!(%addr, "Listening");
 
@@ -69,14 +71,16 @@ pub async fn run(
             let tls_cache = tls_cache.clone();
             let resolver = resolver.clone();
             let registry = registry.clone();
+            let evaluator = evaluator.clone();
 
             // Use Infallible error type — all errors handled internally as responses
             let svc = service_fn(move |req: Request<Incoming>| {
                 let tls_cache = tls_cache.clone();
                 let resolver = resolver.clone();
                 let registry = registry.clone();
+                let evaluator = evaluator.clone();
                 async move {
-                    Ok::<_, Infallible>(handle(req, peer, tls_cache, resolver, registry).await)
+                    Ok::<_, Infallible>(handle(req, peer, tls_cache, resolver, registry, evaluator).await)
                 }
             });
 
@@ -103,6 +107,7 @@ async fn handle(
     tls_cache: Arc<TlsCache>,
     resolver: Arc<Resolver>,
     registry: Arc<Registry>,
+    evaluator: Arc<policy::Evaluator>,
 ) -> Response<BoxBody> {
     if req.method() == Method::CONNECT {
         return handle_connect(req, peer, tls_cache, resolver, registry).await;
@@ -128,6 +133,7 @@ async fn handle_connect(
     tls_cache: Arc<TlsCache>,
     resolver: Arc<Resolver>,
     registry: Arc<Registry>,
+    evaluator: Arc<policy::Evaluator>,
 ) -> Response<BoxBody> {
     let host_port = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
     let hostname = host_port.split(':').next().unwrap_or(&host_port).to_string();
@@ -165,13 +171,14 @@ async fn handle_connect(
     let host = hostname.clone();
     let addr = format!("{}:{}", hostname, port);
     let registry = registry.clone();
+    let evaluator = evaluator.clone();
 
     tokio::spawn(async move {
         let upgraded = match hyper::upgrade::on(req).await {
             Ok(u) => u,
             Err(e) => { error!(error = %e, "Upgrade failed"); return; }
         };
-        if let Err(e) = mitm_tunnel(upgraded, &host, &addr, tls_cache, cred, registry).await {
+        if let Err(e) = mitm_tunnel(upgraded, &host, &addr, tls_cache, cred, registry, evaluator).await {
             let msg = e.to_string();
             if !msg.contains("early eof") && !msg.contains("connection closed") {
                 warn!(host = %host, error = %msg, "MITM tunnel error");
@@ -206,6 +213,7 @@ async fn mitm_tunnel(
     tls_cache: Arc<TlsCache>,
     credential: crate::credential::ResolvedCredential,
     registry: Arc<Registry>,
+    evaluator: Arc<policy::Evaluator>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server_config = tls_cache.get_or_create(hostname)?;
     let acceptor = TlsAcceptor::from(server_config);
@@ -219,8 +227,9 @@ async fn mitm_tunnel(
         let hn = hostname.clone();
         let cred = credential.clone();
         let registry = registry.clone();
+        let evaluator = evaluator.clone();
         async move {
-            Ok::<_, Infallible>(forward_with_credential(req, &hn, &hp, &cred, registry).await)
+            Ok::<_, Infallible>(forward_with_credential(req, &hn, &hp, &cred, registry, evaluator).await)
         }
     });
 
@@ -246,6 +255,7 @@ async fn forward_with_credential(
     host_port: &str,
     cred: &crate::credential::ResolvedCredential,
     registry: Arc<Registry>,
+    evaluator: Arc<policy::Evaluator>,
 ) -> Response<BoxBody> {
     let method = req.method().clone();
     let uri = req.uri().clone();

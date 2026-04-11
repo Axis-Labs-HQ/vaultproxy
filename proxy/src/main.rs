@@ -1,6 +1,7 @@
 mod ca;
 mod credential;
 mod proxy;
+mod policy;
 mod providers;
 
 // Re-export so other modules can use types like DynamicRule as crate::providers::DynamicRule
@@ -64,12 +65,16 @@ async fn main() {
     ));
 
     let registry = providers::Registry::new();
+    let evaluator = Arc::new(policy::Evaluator::new(
+        cli.control_plane_url.clone(),
+        cli.proxy_token.clone(),
+    ));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     info!(%addr, control_plane = %cli.control_plane_url, "VaultProxy HTTPS proxy starting");
     info!("Trust the CA cert: {}/ca.crt", cli.ca_dir);
 
-    if let Err(e) = proxy::run(addr, ca, resolver, registry).await {
+    if let Err(e) = proxy::run(addr, ca, resolver, registry, evaluator).await {
         error!(error = %e, "Proxy server failed");
         std::process::exit(1);
     }
