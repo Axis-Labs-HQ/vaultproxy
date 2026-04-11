@@ -33,6 +33,37 @@ func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ProviderInfo is a single entry in the provider registry.
+type ProviderInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	BaseURL     string `json:"base_url"`
+	BaseURLEnv  string `json:"base_url_env,omitempty"`
+	AuthHeader  string `json:"auth_header"`
+	ProxyCompat bool   `json:"proxy_compatible"`
+}
+
+// SF-7: Single source of truth for provider metadata. Dashboard and CLI
+// fetch from this endpoint instead of maintaining their own registries.
+var providerRegistry = []ProviderInfo{
+	{ID: "openai", Name: "OpenAI", BaseURL: "https://api.openai.com", BaseURLEnv: "OPENAI_BASE_URL", AuthHeader: "Authorization: Bearer", ProxyCompat: true},
+	{ID: "anthropic", Name: "Anthropic", BaseURL: "https://api.anthropic.com", BaseURLEnv: "ANTHROPIC_BASE_URL", AuthHeader: "x-api-key", ProxyCompat: true},
+	{ID: "stripe", Name: "Stripe", BaseURL: "https://api.stripe.com", AuthHeader: "Authorization: Bearer", ProxyCompat: true},
+	{ID: "sendgrid", Name: "SendGrid", BaseURL: "https://api.sendgrid.com", AuthHeader: "Authorization: Bearer", ProxyCompat: true},
+	{ID: "twilio", Name: "Twilio", BaseURL: "https://api.twilio.com", AuthHeader: "Authorization: Basic", ProxyCompat: false},
+	{ID: "railway", Name: "Railway", BaseURL: "https://backboard.railway.com", AuthHeader: "Authorization: Bearer", ProxyCompat: true},
+	{ID: "replicate", Name: "Replicate", BaseURL: "https://api.replicate.com", AuthHeader: "Authorization: Bearer", ProxyCompat: true},
+	{ID: "cohere", Name: "Cohere", BaseURL: "https://api.cohere.ai", AuthHeader: "Authorization: Bearer", ProxyCompat: true},
+	{ID: "mistral", Name: "Mistral", BaseURL: "https://api.mistral.ai", BaseURLEnv: "MISTRAL_API_BASE_URL", AuthHeader: "Authorization: Bearer", ProxyCompat: true},
+	{ID: "custom", Name: "Custom", BaseURL: "", AuthHeader: "Authorization: Bearer", ProxyCompat: true},
+}
+
+// ListProviders returns the provider registry.
+func (h *Handlers) ListProviders(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(providerRegistry)
+}
+
 // orgIDFromContext returns the org ID from the request. For authenticated routes
 // it comes from the JWT claims; for proxy token routes it comes from X-Org-ID.
 func orgIDFromContext(r *http.Request) string {
@@ -48,6 +79,16 @@ func userIDFromContext(r *http.Request) string {
 		return id
 	}
 	return ""
+}
+
+// ensureOrg creates the organization row if it doesn't exist. The dashboard
+// (Better Auth) manages orgs in its own database; the control plane needs a
+// matching row for foreign key constraints. Upsert is a no-op for existing orgs.
+func (h *Handlers) ensureOrg(orgID string) {
+	_, _ = h.db.Exec(
+		`INSERT OR IGNORE INTO organizations (id, name, slug) VALUES (?, ?, ?)`,
+		orgID, orgID, orgID,
+	)
 }
 
 // ------------------------------------------------------------------
@@ -73,16 +114,33 @@ func (h *Handlers) ListKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := h.db.QueryContext(r.Context(),
-		`SELECT id, org_id, name, provider, key_prefix, alias, is_active, last_rotated_at, created_at
-		 FROM api_keys WHERE org_id = ? ORDER BY created_at DESC`, orgID)
+	// PERF-004: Paginated with default limit of 100
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 500 {
+			limit = parsed
+		}
+	}
+	cursor := r.URL.Query().Get("cursor")
+
+	var rows *sql.Rows
+	var err error
+	if cursor != "" {
+		rows, err = h.db.QueryContext(r.Context(),
+			`SELECT id, org_id, name, provider, key_prefix, alias, is_active, last_rotated_at, created_at
+			 FROM api_keys WHERE org_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?`, orgID, cursor, limit)
+	} else {
+		rows, err = h.db.QueryContext(r.Context(),
+			`SELECT id, org_id, name, provider, key_prefix, alias, is_active, last_rotated_at, created_at
+			 FROM api_keys WHERE org_id = ? ORDER BY created_at DESC LIMIT ?`, orgID, limit)
+	}
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to list keys")
 		return
 	}
 	defer rows.Close()
 
-	var result []keys.APIKey
+	result := make([]keys.APIKey, 0)
 	for rows.Next() {
 		var k keys.APIKey
 		if err := rows.Scan(&k.ID, &k.OrgID, &k.Name, &k.Provider, &k.KeyPrefix, &k.Alias,
@@ -121,10 +179,24 @@ func (h *Handlers) CreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.TrimSpace(req.Name) == "" {
+		WriteError(w, http.StatusBadRequest, ErrCodeBadRequest, "name is required")
+		return
+	}
+	if strings.TrimSpace(req.Provider) == "" {
+		WriteError(w, http.StatusBadRequest, ErrCodeBadRequest, "provider is required")
+		return
+	}
+	if strings.TrimSpace(req.RawKey) == "" {
+		WriteError(w, http.StatusBadRequest, ErrCodeBadRequest, "key is required")
+		return
+	}
 	if !aliasRegexp.MatchString(req.Alias) {
 		WriteError(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid alias format")
 		return
 	}
+
+	h.ensureOrg(orgID)
 
 	apiKey, err := h.keys.Store(orgID, req.Name, req.Provider, req.RawKey, req.Alias)
 	if err != nil {
@@ -241,7 +313,49 @@ func (h *Handlers) DeactivateKey(w http.ResponseWriter, r *http.Request) {
 // ------------------------------------------------------------------
 
 func (h *Handlers) ListTokens(w http.ResponseWriter, r *http.Request) {
-	WriteError(w, http.StatusNotImplemented, "not_implemented", "not implemented")
+	orgID := orgIDFromContext(r)
+	if orgID == "" {
+		WriteError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "missing org context")
+		return
+	}
+
+	// PERF-004: Paginated with default limit of 100
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 500 {
+			limit = parsed
+		}
+	}
+
+	rows, err := h.db.QueryContext(r.Context(),
+		`SELECT id, name, scopes, created_at, expires_at FROM proxy_tokens WHERE org_id = ? ORDER BY created_at DESC LIMIT ?`, orgID, limit)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to list tokens")
+		return
+	}
+	defer rows.Close()
+
+	type tokenRow struct {
+		ID        string  `json:"id"`
+		Name      string  `json:"name"`
+		Scopes    string  `json:"scopes"`
+		CreatedAt string  `json:"created_at"`
+		ExpiresAt *string `json:"expires_at"`
+	}
+	var tokens []tokenRow
+	for rows.Next() {
+		var t tokenRow
+		if err := rows.Scan(&t.ID, &t.Name, &t.Scopes, &t.CreatedAt, &t.ExpiresAt); err != nil {
+			continue
+		}
+		tokens = append(tokens, t)
+	}
+	if tokens == nil {
+		tokens = []tokenRow{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tokens)
 }
 
 type createTokenRequest struct {
@@ -263,12 +377,16 @@ func (h *Handlers) CreateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.ensureOrg(orgID)
+
 	rawToken := make([]byte, 32)
 	if _, err := rand.Read(rawToken); err != nil {
 		WriteError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to generate token")
 		return
 	}
-	tokenStr := hex.EncodeToString(rawToken)
+	// SF-6: Prefix with vp_ so proxy tokens are identifiable and don't
+	// conflict with provider SDK client-side validation (e.g. sk-* for OpenAI).
+	tokenStr := "vp_" + hex.EncodeToString(rawToken)
 	hashed := sha256.Sum256([]byte(tokenStr))
 	tokenHash := hex.EncodeToString(hashed[:])
 
@@ -299,7 +417,25 @@ func (h *Handlers) CreateToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) DeleteToken(w http.ResponseWriter, r *http.Request) {
-	WriteError(w, http.StatusNotImplemented, "not_implemented", "not implemented")
+	orgID := orgIDFromContext(r)
+	if orgID == "" {
+		WriteError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "missing org context")
+		return
+	}
+	tokenID := chi.URLParam(r, "tokenID")
+
+	res, err := h.db.ExecContext(r.Context(),
+		`DELETE FROM proxy_tokens WHERE id = ? AND org_id = ?`, tokenID, orgID)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to delete token")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		WriteError(w, http.StatusNotFound, ErrCodeNotFound, "token not found")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ------------------------------------------------------------------
@@ -375,7 +511,77 @@ func (h *Handlers) ListPushTargets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) CreatePushTarget(w http.ResponseWriter, r *http.Request) {
-	WriteError(w, http.StatusNotImplemented, "not_implemented", "not implemented")
+	orgID := orgIDFromContext(r)
+	if orgID == "" {
+		WriteError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "missing org context")
+		return
+	}
+
+	var req struct {
+		APIKeyID string            `json:"api_key_id"`
+		Platform string            `json:"platform"`
+		Config   map[string]string `json:"config"`
+		EnvVar   string            `json:"env_var"`
+		Mode     string            `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid request body")
+		return
+	}
+	if req.APIKeyID == "" || req.Platform == "" || req.EnvVar == "" {
+		WriteError(w, http.StatusBadRequest, ErrCodeBadRequest, "api_key_id, platform, and env_var are required")
+		return
+	}
+	if req.Mode == "" {
+		req.Mode = "fetch"
+	}
+
+	// Validate platform
+	p, err := h.push.Get(req.Platform)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, ErrCodeBadRequest, "unknown platform: "+req.Platform)
+		return
+	}
+	if err := p.Validate(req.Config); err != nil {
+		WriteError(w, http.StatusBadRequest, ErrCodeBadRequest, "invalid config: "+err.Error())
+		return
+	}
+
+	// Verify the key belongs to this org
+	var keyExists bool
+	h.db.QueryRowContext(r.Context(),
+		`SELECT 1 FROM api_keys WHERE id = ? AND org_id = ?`, req.APIKeyID, orgID,
+	).Scan(&keyExists)
+	if !keyExists {
+		WriteError(w, http.StatusNotFound, ErrCodeNotFound, "key not found in this org")
+		return
+	}
+
+	// MF-5: Encrypt the platform config (contains API tokens)
+	configJSON, _ := json.Marshal(req.Config)
+	encryptedConfig, err := h.keys.Encrypt(configJSON)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to encrypt config")
+		return
+	}
+
+	idBytes := make([]byte, 16)
+	rand.Read(idBytes)
+	id := hex.EncodeToString(idBytes)
+
+	_, err = h.db.ExecContext(r.Context(),
+		`INSERT INTO push_targets (id, org_id, api_key_id, platform, encrypted_config, env_var, mode)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		id, orgID, req.APIKeyID, req.Platform, encryptedConfig, req.EnvVar, req.Mode,
+	)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to create push target")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"id": id, "platform": req.Platform})
 }
 
 // SyncPushTarget pushes the decrypted API key to a platform env var, fetching
@@ -388,16 +594,16 @@ func (h *Handlers) SyncPushTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	targetID := chi.URLParam(r, "targetID")
 
-	var platform, configJSON, envVar string
-	var encryptedKey []byte
+	var platform, envVar string
+	var encryptedConfig, encryptedKey []byte
 	err := h.db.QueryRowContext(r.Context(),
-		`SELECT pt.platform, pt.config, pt.env_var, ak.encrypted_key
+		`SELECT pt.platform, pt.encrypted_config, pt.env_var, ak.encrypted_key
 		 FROM push_targets pt
 		 JOIN api_keys ak ON ak.id = pt.api_key_id
 		 WHERE pt.id = ? AND pt.org_id = ? AND ak.is_active = TRUE
 		 LIMIT 1`,
 		targetID, orgID,
-	).Scan(&platform, &configJSON, &envVar, &encryptedKey)
+	).Scan(&platform, &encryptedConfig, &envVar, &encryptedKey)
 	if err == sql.ErrNoRows {
 		WriteError(w, http.StatusNotFound, ErrCodeNotFound, "push target not found")
 		return
@@ -413,8 +619,18 @@ func (h *Handlers) SyncPushTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// MF-5: Decrypt platform config (contains API tokens)
 	var config map[string]string
-	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+	if encryptedConfig != nil {
+		decryptedConfig, err := h.keys.Decrypt(encryptedConfig)
+		if err != nil {
+			WriteError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to decrypt platform config")
+			return
+		}
+		if err := json.Unmarshal(decryptedConfig, &config); err != nil {
+			config = map[string]string{}
+		}
+	} else {
 		config = map[string]string{}
 	}
 
@@ -430,7 +646,8 @@ func (h *Handlers) SyncPushTarget(w http.ResponseWriter, r *http.Request) {
 		Config:   config,
 		EnvVar:   envVar,
 	}
-	if err := p.Push(r.Context(), target, envVar, string(rawKey)); err != nil {
+	envVars := map[string]string{envVar: string(rawKey)}
+	if err := p.Push(r.Context(), target, envVars); err != nil {
 		WriteError(w, http.StatusInternalServerError, ErrCodeInternalError, "push failed")
 		return
 	}
@@ -445,7 +662,25 @@ func (h *Handlers) SyncPushTarget(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) DeletePushTarget(w http.ResponseWriter, r *http.Request) {
-	WriteError(w, http.StatusNotImplemented, "not_implemented", "not implemented")
+	orgID := orgIDFromContext(r)
+	if orgID == "" {
+		WriteError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "missing org context")
+		return
+	}
+	targetID := chi.URLParam(r, "targetID")
+
+	res, err := h.db.ExecContext(r.Context(),
+		`DELETE FROM push_targets WHERE id = ? AND org_id = ?`, targetID, orgID)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to delete push target")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		WriteError(w, http.StatusNotFound, ErrCodeNotFound, "push target not found")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ------------------------------------------------------------------

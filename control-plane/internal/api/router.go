@@ -1,11 +1,12 @@
 package api
 
 import (
-	"database/sql"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/davekim917/vaultproxy/control-plane/internal/config"
+	"github.com/davekim917/vaultproxy/control-plane/internal/db"
 	"github.com/davekim917/vaultproxy/control-plane/internal/keys"
 	"github.com/davekim917/vaultproxy/control-plane/internal/push"
 	"github.com/go-chi/chi/v5"
@@ -13,7 +14,7 @@ import (
 	"github.com/go-chi/cors"
 )
 
-func NewRouter(db *sql.DB, cfg *config.Config) (http.Handler, error) {
+func NewRouter(database *db.DB, cfg *config.Config) (http.Handler, error) {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
@@ -29,30 +30,41 @@ func NewRouter(db *sql.DB, cfg *config.Config) (http.Handler, error) {
 		})
 	})
 
+	// MF-3: Restrict CORS to dashboard origin. Wildcard + credentials is spec-invalid
+	// and allows any website to make authenticated requests to the API.
+	allowedOrigins := strings.Split(cfg.AllowedOrigins, ",")
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"*"},
+		AllowedOrigins:   allowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Authorization", "Content-Type"},
+		AllowedHeaders:   []string{"Authorization", "Content-Type", "X-Org-ID", "X-User-ID"},
 		ExposedHeaders:   []string{"X-Request-ID"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
 
-	keySvc, err := keys.NewService(db, cfg.JWTSecret)
+	keySvc, err := keys.NewService(database.DB, cfg.EncryptionMasterKey)
 	if err != nil {
 		return nil, fmt.Errorf("init key service: %w", err)
 	}
 	pushRegistry := push.NewRegistry()
 
+	// Register push sync platform adapters
+	pushRegistry.Register(&push.Railway{})
+	pushRegistry.Register(&push.Vercel{})
+	pushRegistry.Register(&push.RenderPlatform{})
+	pushRegistry.Register(&push.Netlify{})
+	pushRegistry.Register(&push.FlyIO{})
+
 	h := &Handlers{
-		db:   db,
+		db:   database.DB,
 		keys: keySvc,
 		push: pushRegistry,
 		cfg:  cfg,
 	}
 
-	// Health
+	// Health + public endpoints
 	r.Get("/health", h.Health)
+	r.Get("/api/v1/providers", h.ListProviders)
 
 	// API v1
 	r.Route("/api/v1", func(r chi.Router) {
@@ -97,6 +109,8 @@ func NewRouter(db *sql.DB, cfg *config.Config) (http.Handler, error) {
 	r.Group(func(r chi.Router) {
 		r.Use(h.ProxyTokenMiddleware)
 		r.Get("/internal/resolve/{alias}", h.ResolveKey)
+		r.Get("/internal/fetch/{alias}", h.FetchKey)
+		r.Get("/internal/resolve-by-host/{hostname}", h.ResolveByHost)
 	})
 
 	return r, nil
