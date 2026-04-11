@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"strings"
 
-	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -92,9 +91,7 @@ func Open(dsn string) (*DB, error) {
 }
 
 func detectDriver(dsn string) Driver {
-	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		return DriverPostgres
-	}
+	// OSS version is SQLite-only. For Postgres support, see VaultProxy Cloud.
 	return DriverSQLite
 }
 
