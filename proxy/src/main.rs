@@ -1,6 +1,10 @@
 mod ca;
 mod credential;
 mod proxy;
+mod providers;
+
+// Re-export so other modules can use types like DynamicRule as crate::providers::DynamicRule
+pub use providers::{DynamicRule, InjectSpec, InjectionAction, Provider, Registry};
 
 use clap::Parser;
 use std::net::SocketAddr;
@@ -59,11 +63,13 @@ async fn main() {
         cli.proxy_token.clone(),
     ));
 
+    let registry = providers::Registry::new();
+
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     info!(%addr, control_plane = %cli.control_plane_url, "VaultProxy HTTPS proxy starting");
     info!("Trust the CA cert: {}/ca.crt", cli.ca_dir);
 
-    if let Err(e) = proxy::run(addr, ca, resolver).await {
+    if let Err(e) = proxy::run(addr, ca, resolver, registry).await {
         error!(error = %e, "Proxy server failed");
         std::process::exit(1);
     }

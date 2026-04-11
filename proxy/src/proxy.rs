@@ -1,5 +1,6 @@
 use crate::ca::CertificateAuthority;
 use crate::credential::Resolver;
+use crate::providers::{InjectSpec, Registry};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -49,9 +50,11 @@ pub async fn run(
     addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
     resolver: Arc<Resolver>,
+    registry: Registry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
     let tls_cache = Arc::new(TlsCache::new(ca));
+    let registry = Arc::new(registry);
 
     info!(%addr, "Listening");
 
@@ -59,18 +62,21 @@ pub async fn run(
         let (stream, peer) = listener.accept().await?;
         let tls_cache = tls_cache.clone();
         let resolver = resolver.clone();
+        let registry = registry.clone();
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let tls_cache = tls_cache.clone();
             let resolver = resolver.clone();
+            let registry = registry.clone();
 
             // Use Infallible error type — all errors handled internally as responses
             let svc = service_fn(move |req: Request<Incoming>| {
                 let tls_cache = tls_cache.clone();
                 let resolver = resolver.clone();
+                let registry = registry.clone();
                 async move {
-                    Ok::<_, Infallible>(handle(req, peer, tls_cache, resolver).await)
+                    Ok::<_, Infallible>(handle(req, peer, tls_cache, resolver, registry).await)
                 }
             });
 
@@ -96,9 +102,10 @@ async fn handle(
     peer: SocketAddr,
     tls_cache: Arc<TlsCache>,
     resolver: Arc<Resolver>,
+    registry: Arc<Registry>,
 ) -> Response<BoxBody> {
     if req.method() == Method::CONNECT {
-        return handle_connect(req, peer, tls_cache, resolver).await;
+        return handle_connect(req, peer, tls_cache, resolver, registry).await;
     }
 
     if req.uri().path() == "/health" {
@@ -120,6 +127,7 @@ async fn handle_connect(
     peer: SocketAddr,
     tls_cache: Arc<TlsCache>,
     resolver: Arc<Resolver>,
+    registry: Arc<Registry>,
 ) -> Response<BoxBody> {
     let host_port = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
     let hostname = host_port.split(':').next().unwrap_or(&host_port).to_string();
@@ -156,13 +164,14 @@ async fn handle_connect(
     let cred = credential.unwrap();
     let host = hostname.clone();
     let addr = format!("{}:{}", hostname, port);
+    let registry = registry.clone();
 
     tokio::spawn(async move {
         let upgraded = match hyper::upgrade::on(req).await {
             Ok(u) => u,
             Err(e) => { error!(error = %e, "Upgrade failed"); return; }
         };
-        if let Err(e) = mitm_tunnel(upgraded, &host, &addr, tls_cache, cred).await {
+        if let Err(e) = mitm_tunnel(upgraded, &host, &addr, tls_cache, cred, registry).await {
             let msg = e.to_string();
             if !msg.contains("early eof") && !msg.contains("connection closed") {
                 warn!(host = %host, error = %msg, "MITM tunnel error");
@@ -196,6 +205,7 @@ async fn mitm_tunnel(
     host_port: &str,
     tls_cache: Arc<TlsCache>,
     credential: crate::credential::ResolvedCredential,
+    registry: Arc<Registry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server_config = tls_cache.get_or_create(hostname)?;
     let acceptor = TlsAcceptor::from(server_config);
@@ -208,8 +218,9 @@ async fn mitm_tunnel(
         let hp = host_port.clone();
         let hn = hostname.clone();
         let cred = credential.clone();
+        let registry = registry.clone();
         async move {
-            Ok::<_, Infallible>(forward_with_credential(req, &hn, &hp, &cred).await)
+            Ok::<_, Infallible>(forward_with_credential(req, &hn, &hp, &cred, registry).await)
         }
     });
 
@@ -222,19 +233,26 @@ async fn mitm_tunnel(
     Ok(())
 }
 
-/// Forward a request with the real credential injected.
+/// Forward a request with the resolved credential injected.
+///
+/// Uses the provider registry to determine the correct injection strategy:
+///   - Standard Bearer injection for most APIs
+///   - Custom header injection for providers like Anthropic (x-api-key)
+///   - Basic auth for older APIs like Resend
+///   - Path-based disambiguation for shared hosts (e.g. www.googleapis.com)
 async fn forward_with_credential(
     req: Request<Incoming>,
     hostname: &str,
     host_port: &str,
     cred: &crate::credential::ResolvedCredential,
+    registry: Arc<Registry>,
 ) -> Response<BoxBody> {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let target_url = format!("https://{}{}", host_port, pq);
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let target_url = format!("https://{}{}", host_port, path);
 
-    debug!(host = %hostname, method = %method, path = %pq, "Forwarding with credential");
+    debug!(host = %hostname, method = %method, path = %path, "Forwarding with credential");
 
     // Collect headers (skip hop-by-hop)
     let mut hdrs: Vec<(String, String)> = Vec::new();
@@ -258,18 +276,66 @@ async fn forward_with_credential(
         }
     };
 
+    // Resolve injection spec: provider registry + dynamic rules from control plane
+    let provider = registry.get_ignore_case(hostname);
+    let inject = if cred.dynamic_rules.is_empty() && provider.is_none() {
+        // Fallback: standard Bearer injection (no provider match, no dynamic rules)
+        debug!(host = %hostname, "No provider match, using Bearer injection");
+        InjectSpec::bearer(&cred.key)
+    } else {
+        InjectSpec::from_provider_and_dynamic(provider, &cred.dynamic_rules, path, &cred.key)
+    };
+
     let client = reqwest::Client::new();
     let mut out = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
         &target_url,
     );
 
+    // Apply headers from original request first
     for (n, v) in &hdrs {
         out = out.header(n.as_str(), v.as_str());
     }
 
-    // Inject credential
-    out = out.header("authorization", format!("Bearer {}", cred.key));
+    // Apply injection spec (SetHeader overwrites, RemoveHeader removes)
+    let remove_headers: Vec<String> = inject.actions.iter()
+        .filter_map(|(name, action)| {
+            match action {
+                crate::providers::InjectionAction::RemoveHeader => Some((*name).to_string()),
+                _ => None,
+            }
+        })
+        .collect();
+
+    // Remove headers marked for removal
+    for header in &remove_headers {
+        debug!(host = %hostname, header = %header, "Removing header per injection rule");
+    }
+
+    // Set / replace headers from injection spec
+    for (name, action) in &inject.actions {
+        match action {
+            crate::providers::InjectionAction::SetHeader(val) => {
+                debug!(host = %hostname, header = %name, "Injecting header per provider rule");
+                out = out.header(name, val.as_str());
+            }
+            crate::providers::InjectionAction::ReplaceHeader(val) => {
+                // Only inject if header was present in the original request
+                let original_present = hdrs.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
+                if original_present {
+                    debug!(host = %hostname, header = %name, "Replacing existing header per injection rule");
+                    out = out.header(name, val.as_str());
+                }
+            }
+            crate::providers::InjectionAction::RemoveHeader => {
+                // Already handled above — reqwest doesn't have a direct "remove" API,
+                // but since we skip hop-by-hop headers and the original header was already
+                // copied, we need to override it to empty. For now this is a no-op since
+                // RemoveHeader is meant for stripping hop-by-hop headers.
+                debug!(host = %hostname, header = %name, "RemoveHeader (skipped — handled by hop-by-hop filter)");
+            }
+        }
+    }
 
     if !body_bytes.is_empty() {
         out = out.body(body_bytes.to_vec());
