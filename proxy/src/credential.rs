@@ -3,13 +3,20 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
+use crate::providers::{DynamicRule, Provider};
+
 const RESOLVE_TIMEOUT_MS: u64 = 5000;
 const CACHE_TTL_SECS: u64 = 30;
 const MAX_STALE_SECS: u64 = 60;
 
 #[derive(Clone, Debug)]
 pub struct ResolvedCredential {
+    /// The actual secret value (API key, Bearer token, etc.).
     pub key: String,
+    /// Dynamic injection rules from the control plane (path-based overrides).
+    #[serde(default)]
+    pub dynamic_rules: Vec<DynamicRule>,
+    /// Default auth header name (informational — proxy uses provider registry).
     pub auth_header: String,
     resolved_at: Instant,
 }
@@ -19,6 +26,9 @@ struct ResolveResponse {
     key: String,
     #[serde(default)]
     target_url: Option<String>,
+    /// Path-based injection rules from the control plane.
+    #[serde(default)]
+    dynamic_rules: Vec<DynamicRule>,
 }
 
 /// Resolves hostnames to credentials via the control plane's resolve-by-host endpoint.
@@ -73,6 +83,7 @@ impl Resolver {
                     Ok(data) => {
                         let cred = ResolvedCredential {
                             key: data.key,
+                            dynamic_rules: data.dynamic_rules,
                             auth_header: "Authorization".to_string(),
                             resolved_at: Instant::now(),
                         };
