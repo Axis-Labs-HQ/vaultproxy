@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@theme {
+  /* Warm neutral scale — cream-tinted grays */
+  --color-cream-50: #FDFCF9;
+  --color-cream-100: #F7F5F0;
+  --color-cream-200: #EDEBE4;
+  --color-cream-300: #DFDCD3;
+  --color-cream-400: #C6C2B8;
+  --color-cream-500: #9E998D;
+  --color-cream-600: #6F6B62;
+  --color-cream-700: #4D4942;
+  --color-cream-800: #2D2A25;
+  --color-cream-900: #1A1815;
+
+  /* Terracotta accent */
+  --color-terra: #C74B28;
+  --color-terra-hover: #A93F21;
+  --color-terra-subtle: #F9EBE6;
+
+  /* Warm semantic: sage green (success) */
+  --color-sage-50: #F0F4EC;
+  --color-sage-200: #CED8C6;
+  --color-sage-600: #527A45;
+  --color-sage-700: #44663A;
+  --color-sage-800: #374F2F;
+
+  /* Warm semantic: ember red (error/danger) */
+  --color-ember-50: #FAE8E5;
+  --color-ember-100: #F2D2CC;
+  --color-ember-600: #B5372F;
+  --color-ember-700: #972E28;
+
+  /* Animations */
+  --animate-fade-in: fade-in 200ms ease-out;
+  --animate-slide-in: slide-in 200ms ease-out;
+}
+
+/* Font families — override Tailwind defaults with next/font CSS variables */
+:root {
+  --font-sans: var(--font-jakarta), system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, 'Courier New', monospace;
+}
+
+::selection {
+  background-color: var(--color-terra-subtle);
+  color: var(--color-cream-900);
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slide-in {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

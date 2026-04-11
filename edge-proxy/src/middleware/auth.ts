@@ -8,7 +8,7 @@ import type { Context, Next } from "hono";
 export async function authMiddleware(c: Context, next: Next) {
   const authHeader = c.req.header("Authorization");
 
-  if (!authHeader?.startsWith("Bearer vp_")) {
+  if (!authHeader?.startsWith("Bearer ")) {
     return c.json({ error: "Missing or invalid proxy token" }, 401);
   }
 

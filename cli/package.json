@@ -1,0 +1,35 @@
+{
+  "name": "@vaultproxy/cli",
+  "version": "0.1.0",
+  "description": "VaultProxy CLI — fetch, inject, and proxy API keys",
+  "bin": {
+    "vp": "./bin/vp.js"
+  },
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/",
+    "lib/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Axis-Labs-HQ/vaultproxy-cloud",
+    "directory": "cli"
+  },
+  "homepage": "https://vaultproxy.dev",
+  "keywords": [
+    "api-keys",
+    "secrets",
+    "proxy",
+    "rotation",
+    "vault",
+    "security",
+    "cli"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

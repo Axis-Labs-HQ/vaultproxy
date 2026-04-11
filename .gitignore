@@ -35,6 +35,9 @@ Thumbs.db
 # Build
 dist/
 build/
+
+# Rust
+proxy/target/
 .git.broken
 dashboard/node_modules/
 edge-proxy/node_modules/

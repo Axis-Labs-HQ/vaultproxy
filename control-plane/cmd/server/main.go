@@ -26,6 +26,7 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to open database")
 	}
 	defer database.Close()
+	log.Info().Str("driver", string(database.Driver)).Msg("database connected")
 
 	if err := db.Migrate(database); err != nil {
 		log.Fatal().Err(err).Msg("failed to run migrations")
