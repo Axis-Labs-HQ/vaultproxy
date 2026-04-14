@@ -35,3 +35,26 @@ jobs:
           node-version: "20"
       - run: npm install
       - run: npm run typecheck
+
+  cli-publish:
+    name: CLI Publish (npm)
+    runs-on: ubuntu-latest
+    # Only publish when a version tag is pushed (e.g. v0.1.0)
+    if: startsWith(github.ref, 'refs/tags/v')
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: https://registry.npmjs.org
+      - run: npm install
+      # NOTE: NPM_TOKEN must be added as a GitHub Actions secret on the repo.
+      # Go to: Settings > Secrets and variables > Actions > New repository secret
+      # Name: NPM_TOKEN
+      # Value: your npmjs.com automation token with "publish" permission for @vaultproxy/cli
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
